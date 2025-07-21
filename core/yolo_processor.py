@@ -26,6 +26,8 @@ class YOLOProcessorThread(QThread):
     error_occurred = pyqtSignal(str)  # 错误信号
     processing_finished = pyqtSignal()  # 处理完成信号
     detection_info_updated = pyqtSignal(str)  # 检测信息更新信号
+    model_loaded = pyqtSignal(str)  # 模型加载成功信号
+    video_info_updated = pyqtSignal(int, float, int, int)  # 视频信息更新信号
     
     def __init__(self, processor):
         super().__init__()
@@ -46,6 +48,8 @@ class YOLOProcessorThread(QThread):
             self.processor.error_occurred.connect(self.error_occurred)
             self.processor.processing_finished.connect(self.processing_finished)
             self.processor.detection_info_updated.connect(self.detection_info_updated)
+            self.processor.model_loaded.connect(self.model_loaded)
+            self.processor.video_info_updated.connect(self.video_info_updated)
             
             # 开始处理
             self.processor.process_video(self.video_path)
@@ -60,6 +64,8 @@ class YOLOProcessor(QObject):
     error_occurred = pyqtSignal(str)  # 错误信号
     processing_finished = pyqtSignal()  # 处理完成信号
     detection_info_updated = pyqtSignal(str)  # 检测信息更新信号
+    model_loaded = pyqtSignal(str)  # 模型加载成功信号，发送模型路径
+    video_info_updated = pyqtSignal(int, float, int, int)  # 视频信息更新信号：总帧数，原始FPS，跳帧数，目标FPS
     
     def __init__(self):
         super().__init__()
@@ -81,10 +87,18 @@ class YOLOProcessor(QObject):
         # 性能统计
         self.frame_count = 0
         self.processed_frame_count = 0  # 实际处理的帧数
+        self.expected_processed_frames = 0  # 预期需要处理的帧数
         self.start_time = None
         
         # 工作线程
         self.worker_thread = None
+        
+        # 导出选项
+        self.export_options = {
+            'save_txt': False,
+            'save_conf': False
+        }
+        self.output_dir = None  # 输出目录
     
     def set_target_fps(self, fps):
         """设置目标处理帧率"""
@@ -179,6 +193,9 @@ class YOLOProcessor(QObject):
             self.model = YOLO(model_path)
             self.is_obb_model = 'obb' in model_path.lower()  # 检测是否为OBB模型
             self.detection_info_updated.emit(f"✅ 模型加载成功: {model_path}")
+            
+            # 发送模型加载成功信号
+            self.model_loaded.emit(model_path)
             return True
             
         except Exception as e:
@@ -205,6 +222,18 @@ class YOLOProcessor(QObject):
         """设置是否启用跟踪"""
         self.tracking_enabled = enabled
     
+    def set_export_options(self, save_txt=False, save_conf=False, output_dir=None):
+        """设置导出选项"""
+        self.export_options = {
+            'save_txt': save_txt,
+            'save_conf': save_conf
+        }
+        self.output_dir = output_dir
+        
+        if save_txt and output_dir:
+            # 确保输出目录存在
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+    
     def process_video(self, video_path):
         """处理视频文件"""
         try:
@@ -226,15 +255,23 @@ class YOLOProcessor(QObject):
             # 计算跳帧数量
             self.skip_frames = max(1, int(original_fps / self.target_fps))
             
+            # 计算实际需要处理的帧数（基于跳帧逻辑）
+            expected_processed_frames = (total_frames + self.skip_frames - 1) // self.skip_frames  # 向上取整
+            video_duration = total_frames / original_fps  # 视频时长（秒）
+            
             self.is_processing = True
             self.frame_count = 0
             self.processed_frame_count = 0
+            self.expected_processed_frames = expected_processed_frames
             self.start_time = time.time()
             self.detection_results.clear()
             
+            # 发送视频信息和处理参数
+            self.video_info_updated.emit(total_frames, original_fps, self.skip_frames, self.target_fps)
+            
             # 发送初始信息
-            self.detection_info_updated.emit(f"视频信息: {total_frames}帧, {original_fps:.1f}FPS")
-            self.detection_info_updated.emit(f"处理设置: 目标{self.target_fps}FPS, 每{self.skip_frames}帧处理1帧")
+            self.detection_info_updated.emit(f"视频信息: {total_frames}帧, {original_fps:.1f}FPS, 时长{video_duration:.1f}秒")
+            self.detection_info_updated.emit(f"处理设置: 目标{self.target_fps}FPS, 需处理{expected_processed_frames}帧, 每{self.skip_frames}帧处理1帧")
             
             # 逐帧处理
             while self.is_processing:
@@ -260,9 +297,17 @@ class YOLOProcessor(QObject):
                     
                     self.processed_frame_count += 1
                 
-                # 更新进度
-                progress = int((self.frame_count / total_frames) * 100)
-                self.progress_updated.emit(self.frame_count + 1, total_frames, progress)
+                # 更新进度（基于实际处理的帧数）
+                if self.expected_processed_frames > 0:
+                    # 确保processed_frame_count不超过expected_processed_frames
+                    actual_processed = min(self.processed_frame_count, self.expected_processed_frames)
+                    progress = int((actual_processed / self.expected_processed_frames) * 100)
+                    progress = min(progress, 100)  # 确保进度不超过100%
+                else:
+                    actual_processed = self.processed_frame_count
+                    progress = 0
+                    
+                self.progress_updated.emit(actual_processed, self.expected_processed_frames, progress)
                 
                 # 更新FPS（每10个处理帧更新一次）
                 if self.processed_frame_count > 0 and self.processed_frame_count % 10 == 0:
@@ -398,6 +443,10 @@ class YOLOProcessor(QObject):
             # 保存检测结果
             self.detection_results.append(detection_info)
             
+            # 如果启用了txt文件导出，保存标签到txt文件
+            if self.export_options['save_txt'] and self.output_dir and detection_info['count'] > 0:
+                self.save_labels_to_txt(frame_index, detection_info, frame.shape)
+            
         except Exception as e:
             print(f"处理帧 {frame_index} 时出错: {e}")
         
@@ -418,6 +467,67 @@ class YOLOProcessor(QObject):
             (0, 128, 0),    # 深绿色
         ]
         return colors[class_id % len(colors)]
+    
+    def save_labels_to_txt(self, frame_index, detection_info, frame_shape):
+        """保存标签到txt文件（YOLO格式）"""
+        try:
+            if not self.output_dir:
+                return
+            
+            txt_filename = f"frame_{frame_index:06d}.txt"
+            txt_path = Path(self.output_dir) / txt_filename
+            
+            height, width = frame_shape[:2]
+            
+            with open(txt_path, 'w', encoding='utf-8') as f:
+                for obj in detection_info['objects']:
+                    class_id = obj['class_id']
+                    confidence = obj['confidence']
+                    bbox = obj['bbox']
+                    bbox_type = obj['bbox_type']
+                    
+                    if bbox_type == 'obb':
+                        # OBB格式：8个点的坐标 -> 归一化
+                        points = np.array(bbox).reshape(-1, 2)
+                        # 归一化坐标
+                        norm_points = points.copy()
+                        norm_points[:, 0] /= width  # x坐标归一化
+                        norm_points[:, 1] /= height  # y坐标归一化
+                        
+                        # YOLO OBB格式：class_id x1 y1 x2 y2 x3 y3 x4 y4 [confidence]
+                        line_parts = [str(class_id)]
+                        for point in norm_points:
+                            line_parts.extend([f"{point[0]:.6f}", f"{point[1]:.6f}"])
+                        
+                        if self.export_options['save_conf']:
+                            line_parts.append(f"{confidence:.6f}")
+                        
+                    else:
+                        # 普通边界框格式：xyxy -> 中心点+宽高格式
+                        x1, y1, x2, y2 = bbox
+                        
+                        # 转换为YOLO格式（中心点坐标 + 宽高，归一化）
+                        center_x = ((x1 + x2) / 2.0) / width
+                        center_y = ((y1 + y2) / 2.0) / height
+                        box_width = (x2 - x1) / width
+                        box_height = (y2 - y1) / height
+                        
+                        # YOLO格式：class_id center_x center_y width height [confidence]
+                        line_parts = [
+                            str(class_id),
+                            f"{center_x:.6f}",
+                            f"{center_y:.6f}", 
+                            f"{box_width:.6f}",
+                            f"{box_height:.6f}"
+                        ]
+                        
+                        if self.export_options['save_conf']:
+                            line_parts.append(f"{confidence:.6f}")
+                    
+                    f.write(' '.join(line_parts) + '\n')
+                    
+        except Exception as e:
+            self.error_occurred.emit(f"保存标签文件失败: {str(e)}")
     
     def stop_processing(self):
         """停止处理"""

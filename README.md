@@ -72,7 +72,7 @@ YOLOv11目标识别与跟踪可视化界面
 
 ```bash
 # 克隆项目
-git clone <repository-url>
+git clone https://github.com/BIANG-qilie/YOLO-Operator.git
 cd YOLO-Operator
 
 # 安装依赖

@@ -9,11 +9,12 @@ import os
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                             QMenuBar, QToolBar, QStatusBar, QLabel, QPushButton,
                             QComboBox, QCheckBox, QSlider, QTextEdit, QGroupBox,
-                            QFileDialog, QMessageBox, QProgressBar, QSplitter)
+                            QFileDialog, QMessageBox, QProgressBar, QSplitter, QDialog)
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QPixmap, QFont
 from gui.video_widget import VideoWidget
 from gui.progress_dialog import ProgressDialog
+from gui.label_export_dialog import LabelExportDialog
 from core.yolo_processor import YOLOProcessor
 
 class MainWindow(QMainWindow):
@@ -24,6 +25,22 @@ class MainWindow(QMainWindow):
         self.video_processor = None
         self.current_video_path = None
         self.progress_dialog = None
+        
+        # 播放相关状态
+        self.processed_frames = []  # 存储处理后的帧
+        self.original_frames = []   # 存储原始帧
+        self.frame_detection_info = []  # 存储每帧的检测信息
+        self.is_playing = False
+        self.current_frame_index = 0
+        self.total_frames = 0
+        self.skip_frames = 1  # 跳帧数量，从处理器获取
+        self.play_timer = QTimer()
+        self.play_timer.timeout.connect(self.play_next_frame)
+        
+        # 播放相关参数
+        self.play_fps = 25  # 默认播放帧率
+        self.target_fps = 25  # 处理帧率，从处理器获取
+        
         self.init_ui()
         self.init_connections()
     
@@ -187,11 +204,6 @@ class MainWindow(QMainWindow):
         self.play_btn.setEnabled(False)
         control_layout.addWidget(self.play_btn)
         
-        self.pause_btn = QPushButton('暂停')
-        self.pause_btn.clicked.connect(self.pause_video)
-        self.pause_btn.setEnabled(False)
-        control_layout.addWidget(self.pause_btn)
-        
         # 进度条
         control_layout.addWidget(QLabel('进度:'))
         self.progress_slider = QSlider(Qt.Orientation.Horizontal)
@@ -237,8 +249,7 @@ class MainWindow(QMainWindow):
         """初始化信号连接"""
         # 显示启动信息
         self.log_message("系统已启动")
-        self.log_message("当前模型: YOLOv11x-OBB (weights/yolo11x-obb.pt)")
-        self.log_message("支持旋转边界框检测")
+        self.log_message("等待加载模型...")
     
     def log_message(self, message):
         """添加日志消息"""
@@ -251,6 +262,36 @@ class MainWindow(QMainWindow):
         """获取当前时间字符串"""
         from datetime import datetime
         return datetime.now().strftime("%H:%M:%S")
+    
+    def load_original_frames(self, video_path):
+        """加载原始视频帧"""
+        try:
+            import cv2
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                self.log_message("无法打开视频文件加载原始帧")
+                return
+            
+            self.log_message("正在加载原始视频帧...")
+            frame_count = 0
+            
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                self.original_frames.append(frame.copy())
+                frame_count += 1
+                
+                # 每100帧显示一次进度
+                if frame_count % 100 == 0:
+                    self.log_message(f"已加载 {frame_count} 帧...")
+            
+            cap.release()
+            self.log_message(f"原始视频帧加载完成，共 {frame_count} 帧")
+            
+        except Exception as e:
+            self.log_message(f"加载原始视频帧失败: {str(e)}")
     
     # 槽函数
     def import_video(self):
@@ -266,9 +307,21 @@ class MainWindow(QMainWindow):
             self.current_video_path = file_path
             self.log_message(f"导入视频: {os.path.basename(file_path)}")
             
+            # 清空之前的帧数据
+            self.processed_frames.clear()
+            self.original_frames.clear()
+            self.frame_detection_info.clear()
+            self.is_playing = False
+            self.current_frame_index = 0
+            self.play_timer.stop()
+            self.play_btn.setText('播放')
+            
+            # 预加载原始视频帧
+            self.load_original_frames(file_path)
+            
             # 启用相关按钮
             self.start_btn.setEnabled(True)
-            self.play_btn.setEnabled(True)
+            self.play_btn.setEnabled(False)  # 需要先检测才能播放
             
             # 加载视频到原始视频窗口
             self.original_video.load_video(file_path)
@@ -281,7 +334,49 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, '警告', '请先导入视频文件！')
             return
         
+        # 显示标签导出选项对话框
+        export_dialog = LabelExportDialog(self)
+        if export_dialog.exec() != QDialog.DialogCode.Accepted:
+            # 用户取消了，不进行处理
+            return
+        
+        # 获取用户选择的导出选项
+        export_options = export_dialog.get_export_options()
+        self.log_message(f'标签导出选项: 保存txt={export_options["save_txt"]}, 包含置信度={export_options["save_conf"]}')
+        
+        # 使用用户选择的输出目录，如果没有选择则询问用户
+        output_dir = export_options.get("output_dir")
+        if export_options["save_txt"]:
+            if not output_dir:
+                # 用户没有选择目录，弹出选择对话框
+                from PyQt6.QtWidgets import QFileDialog
+                output_dir = QFileDialog.getExistingDirectory(
+                    self,
+                    "选择标签输出目录",
+                    f"output",  # 默认目录
+                    QFileDialog.Option.ShowDirsOnly
+                )
+                
+                if not output_dir:
+                    # 用户取消选择，使用默认目录
+                    video_name = os.path.splitext(os.path.basename(self.current_video_path))[0]
+                    output_dir = f"output/{video_name}_labels"
+                    self.log_message('未选择输出目录，将使用默认目录')
+                
+            self.log_message(f'标签将保存到: {output_dir}')
+        
         self.log_message('开始YOLO目标识别...')
+        
+        # 清空之前的处理结果
+        self.processed_frames.clear()
+        self.frame_detection_info.clear()
+        self.is_playing = False
+        self.current_frame_index = 0
+        self.play_timer.stop()
+        self.play_btn.setText('播放')
+        self.play_btn.setEnabled(False)
+        self.progress_slider.setEnabled(False)
+        
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.progress_bar.setVisible(True)
@@ -300,6 +395,13 @@ class MainWindow(QMainWindow):
         self.video_processor.set_tracking_enabled(self.tracking_check.isChecked())
         self.video_processor.set_tracker(self.tracker_combo.currentText())
         self.video_processor.set_target_fps(int(self.fps_combo.currentText()))
+        
+        # 设置导出选项
+        self.video_processor.set_export_options(
+            save_txt=export_options["save_txt"],
+            save_conf=export_options["save_conf"],
+            output_dir=output_dir
+        )
         
         # 显示进度对话框
         self.progress_dialog.reset()
@@ -320,6 +422,8 @@ class MainWindow(QMainWindow):
                 self.video_processor.worker_thread.error_occurred.connect(self.on_processing_error)
                 self.video_processor.worker_thread.processing_finished.connect(self.on_processing_finished)
                 self.video_processor.worker_thread.detection_info_updated.connect(self.on_detection_info_updated)
+                self.video_processor.worker_thread.model_loaded.connect(self.on_model_loaded)
+                self.video_processor.worker_thread.video_info_updated.connect(self.on_video_info_updated)
         else:
             self.progress_dialog.add_info("启动处理失败！")
             self.stop_detection()
@@ -354,16 +458,20 @@ class MainWindow(QMainWindow):
             self.video_processor.error_occurred.connect(self.on_processing_error)
             self.video_processor.processing_finished.connect(self.on_processing_finished)
             self.video_processor.detection_info_updated.connect(self.on_detection_info_updated)
+            self.video_processor.model_loaded.connect(self.on_model_loaded)
+            self.video_processor.video_info_updated.connect(self.on_video_info_updated)
     
-    def on_progress_updated(self, current_frame, total_frames, progress):
+    def on_progress_updated(self, processed_frames, expected_frames, progress):
         """处理进度更新"""
         if self.progress_dialog:
             self.progress_dialog.update_progress(progress)
-            self.progress_dialog.update_status(f"正在处理... {current_frame}/{total_frames} ({progress}%)")
+            self.progress_dialog.update_status(f"正在处理... {processed_frames}/{expected_frames} ({progress}%)")
     
     def on_fps_updated(self, fps):
         """处理FPS更新"""
-        self.fps_label.setText(f'FPS: {fps:.1f}')
+        # 只在处理阶段更新FPS显示（播放时不要覆盖播放帧率）
+        if not self.is_playing:
+            self.fps_label.setText(f'FPS: {fps:.1f} (处理速度)')
         if self.progress_dialog:
             self.progress_dialog.add_info(f"处理速度: {fps:.1f} FPS")
     
@@ -372,14 +480,33 @@ class MainWindow(QMainWindow):
         # 更新处理后的视频显示
         self.processed_video.set_frame(processed_frame)
         
-        # 更新检测数量
+        # 存储处理后的帧和检测信息用于后续播放
+        self.processed_frames.append(processed_frame.copy())
+        self.frame_detection_info.append(detection_info.copy())
+        
+        # 在处理阶段，显示当前帧的检测数量
         count = detection_info.get('count', 0)
-        self.detection_count_label.setText(f'检测数量: {count}')
+        self.detection_count_label.setText(f'检测数量: {count} (处理中)')
     
     def on_detection_info_updated(self, info_text):
         """处理检测信息更新"""
         if self.progress_dialog:
             self.progress_dialog.add_info(info_text)
+    
+    def on_model_loaded(self, model_path):
+        """处理模型加载成功"""
+        model_name = os.path.basename(model_path)
+        self.log_message(f"当前模型: {model_name}")
+        if 'obb' in model_path.lower():
+            self.log_message("支持旋转边界框检测")
+    
+    def on_video_info_updated(self, total_frames, original_fps, skip_frames, target_fps):
+        """处理视频信息更新"""
+        self.skip_frames = skip_frames
+        # 使用处理器传来的目标帧率作为播放帧率
+        self.target_fps = target_fps
+        self.play_fps = target_fps
+        self.log_message(f"视频播放设置: 跳帧={skip_frames}, 原始FPS={original_fps:.1f}, 目标帧率={target_fps}FPS")
     
     def on_processing_error(self, error_message):
         """处理错误"""
@@ -396,6 +523,21 @@ class MainWindow(QMainWindow):
             self.progress_dialog.update_progress(100)
             self.progress_dialog.add_info("检测处理已完成！")
         
+        # 设置总帧数并启用播放控件
+        self.total_frames = len(self.processed_frames)
+        if self.total_frames > 0:
+            self.progress_slider.setMaximum(self.total_frames - 1)
+            self.progress_slider.setEnabled(True)
+            self.play_btn.setEnabled(True)
+            self.play_btn.setText('播放')
+            self.current_frame_index = 0
+            
+            # 重置显示状态为就绪状态，显示播放帧率
+            self.fps_label.setText(f'FPS: {self.play_fps:.1f} (就绪播放)')
+            self.detection_count_label.setText('检测数量: 就绪播放')
+            
+            self.log_message(f'共处理了 {self.total_frames} 帧，可以开始播放')
+        
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.progress_bar.setVisible(False)
@@ -403,18 +545,95 @@ class MainWindow(QMainWindow):
     
     def toggle_play(self):
         """切换播放状态"""
-        # TODO: 实现播放/暂停功能
-        pass
+        if not self.processed_frames:
+            self.log_message('没有可播放的帧，请先进行检测')
+            return
+            
+        if self.is_playing:
+            self.pause_video()
+        else:
+            self.start_playing()
+    
+    def start_playing(self):
+        """开始播放"""
+        if not self.processed_frames:
+            return
+            
+        self.is_playing = True
+        self.play_btn.setText('暂停')
+        
+        # 计算播放间隔，约25FPS播放
+        play_interval = int(1000 / self.play_fps)  # 毫秒
+        self.play_timer.start(play_interval)
+        
+        # 更新FPS显示为播放帧率
+        self.fps_label.setText(f'FPS: {self.play_fps:.1f} (播放中)')
+        
+        self.log_message(f'开始播放处理后的视频 (播放帧率: {self.play_fps:.1f}FPS)')
     
     def pause_video(self):
         """暂停视频"""
-        # TODO: 实现暂停功能
-        pass
+        self.is_playing = False
+        self.play_btn.setText('播放')
+        self.play_timer.stop()
+        
+        # 暂停时仍显示播放相关信息
+        self.fps_label.setText(f'FPS: {self.play_fps:.1f} (暂停)')
+        
+        self.log_message('播放已暂停')
     
     def seek_video(self, position):
         """跳转视频位置"""
-        # TODO: 实现视频跳转功能
-        pass
+        if not self.processed_frames:
+            return
+            
+        if 0 <= position < len(self.processed_frames):
+            self.current_frame_index = position
+            # 显示对应的处理后帧
+            self.processed_video.set_frame(self.processed_frames[position])
+            
+            # 根据跳帧规则显示对应的原始帧
+            original_frame_index = position * self.skip_frames
+            if original_frame_index < len(self.original_frames):
+                self.original_video.set_frame(self.original_frames[original_frame_index])
+            
+            # 显示当前帧的检测数量
+            if position < len(self.frame_detection_info):
+                count = self.frame_detection_info[position].get('count', 0)
+                self.detection_count_label.setText(f'检测数量: {count} (当前帧)')
+            else:
+                self.detection_count_label.setText('检测数量: 0 (当前帧)')
+    
+    def play_next_frame(self):
+        """播放下一帧"""
+        if not self.is_playing or not self.processed_frames:
+            return
+            
+        # 显示当前处理后的帧
+        if self.current_frame_index < len(self.processed_frames):
+            self.processed_video.set_frame(self.processed_frames[self.current_frame_index])
+            
+            # 根据跳帧规则显示对应的原始帧
+            original_frame_index = self.current_frame_index * self.skip_frames
+            if original_frame_index < len(self.original_frames):
+                self.original_video.set_frame(self.original_frames[original_frame_index])
+            
+            # 显示当前帧的检测数量
+            if self.current_frame_index < len(self.frame_detection_info):
+                count = self.frame_detection_info[self.current_frame_index].get('count', 0)
+                self.detection_count_label.setText(f'检测数量: {count} (播放中)')
+            else:
+                self.detection_count_label.setText('检测数量: 0 (播放中)')
+            
+            # 更新进度条
+            self.progress_slider.setValue(self.current_frame_index)
+            
+        # 移动到下一帧
+        self.current_frame_index += 1
+        
+        # 如果播放完成，重新开始或停止
+        if self.current_frame_index >= len(self.processed_frames):
+            self.current_frame_index = 0  # 循环播放
     
     def export_video(self):
         """导出处理后的视频"""

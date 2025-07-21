@@ -30,6 +30,9 @@ yolo_env/
 venv/
 env/
 
+# 输出文件
+output/
+
 # IDE
 .vscode/
 .idea/
@@ -38,4 +41,7 @@ env/
 
 # 系统文件
 .DS_Store
-Thumbs.db 
+Thumbs.db
+
+# 开发文档
+README_DEV.md 
